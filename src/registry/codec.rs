@@ -44,6 +44,17 @@ pub trait Decoder: Send {
     /// Identifier of the codec this decoder handles.
     fn codec_id(&self) -> &CodecId;
 
+    /// Parameters describing this decoder's uncompressed output when known.
+    ///
+    /// Containers describe the compressed stream, which is not necessarily
+    /// enough to configure an output device (for example MPEG-TS AAC may
+    /// initially have no sample format/rate/channel metadata). Decoders that
+    /// know their PCM/video output shape should expose it here. Callers fall
+    /// back to the compressed input parameters when this returns `None`.
+    fn output_params(&self) -> Option<&CodecParameters> {
+        None
+    }
+
     /// Feed one compressed packet. May or may not produce a frame immediately —
     /// call `receive_frame` in a loop afterwards.
     fn send_packet(&mut self, packet: &Packet) -> Result<()>;
