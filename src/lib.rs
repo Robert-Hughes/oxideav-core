@@ -17,6 +17,7 @@ pub mod execution;
 pub mod filter;
 pub mod format;
 pub mod frame;
+pub mod frame_lease;
 pub mod limits;
 pub mod metadata;
 pub mod options;
@@ -38,6 +39,7 @@ pub use format::{
     ChannelLayout, ChannelPosition, MediaType, ParseChannelLayoutError, PixelFormat, SampleFormat,
 };
 pub use frame::{AudioFrame, Frame, VideoFrame, VideoPlane};
+pub use frame_lease::{FrameLease, HardwareVideoFrame, HardwareVideoFrameStorage};
 pub use limits::DecoderLimits;
 pub use metadata::{Attachment, Chapter};
 pub use options::{

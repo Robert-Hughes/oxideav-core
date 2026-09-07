@@ -632,6 +632,7 @@ pub const MAX_PLANES: usize = 4;
 pub struct FrameInner {
     arena: Arena,
     plane_offsets: [(usize, usize); MAX_PLANES],
+    plane_strides: [usize; MAX_PLANES],
     plane_count: u8,
     header: FrameHeader,
 }
@@ -650,14 +651,38 @@ pub type Frame = Rc<FrameInner>;
 impl FrameInner {
     /// Construct a `Frame` (refcounted `Rc<FrameInner>`) from an arena,
     /// a slice of `(offset, length)` plane descriptors, and a header.
-    /// Returns [`Error::InvalidData`] if more than [`MAX_PLANES`]
-    /// planes are supplied or if any plane range falls outside the
-    /// arena's used region.
+    ///
+    /// This compatibility constructor records no explicit row strides; callers
+    /// can infer tight strides from the header's pixel format and dimensions.
+    /// Decoders with padded rows should use [`Self::new_with_strides`].
     pub fn new(arena: Arena, planes: &[(usize, usize)], header: FrameHeader) -> Result<Frame> {
+        Self::new_with_strides(arena, planes, &[], header)
+    }
+
+    /// Construct a frame with explicit byte strides for each image plane.
+    ///
+    /// `strides` must either be empty (all strides unknown) or have exactly one
+    /// entry per plane. A zero stride is treated as unknown for compatibility
+    /// with [`Self::new`]. Returns [`Error::InvalidData`] if the plane/stride
+    /// table is malformed or any plane range falls outside the arena's used
+    /// region.
+    pub fn new_with_strides(
+        arena: Arena,
+        planes: &[(usize, usize)],
+        strides: &[usize],
+        header: FrameHeader,
+    ) -> Result<Frame> {
         if planes.len() > MAX_PLANES {
             return Err(Error::invalid(format!(
                 "FrameInner supports at most {} planes (got {})",
                 MAX_PLANES,
+                planes.len()
+            )));
+        }
+        if !strides.is_empty() && strides.len() != planes.len() {
+            return Err(Error::invalid(format!(
+                "FrameInner stride count {} does not match plane count {}",
+                strides.len(),
                 planes.len()
             )));
         }
@@ -673,12 +698,17 @@ impl FrameInner {
             }
         }
         let mut plane_offsets = [(0usize, 0usize); MAX_PLANES];
+        let mut plane_strides = [0usize; MAX_PLANES];
         for (i, p) in planes.iter().enumerate() {
             plane_offsets[i] = *p;
+            if let Some(stride) = strides.get(i) {
+                plane_strides[i] = *stride;
+            }
         }
         Ok(Rc::new(FrameInner {
             arena,
             plane_offsets,
+            plane_strides,
             plane_count: planes.len() as u8,
             header,
         }))
@@ -712,6 +742,18 @@ impl FrameInner {
             std::slice::from_raw_parts(elem_ptr, len)
         };
         Some(buf)
+    }
+
+    /// Explicit byte stride for plane `i`, when one was supplied at
+    /// construction time. Returns `None` for an out-of-range plane or for a
+    /// frame built through [`Self::new`] where stride is intentionally left for
+    /// the consumer to infer from [`FrameHeader::pixel_format`].
+    pub fn plane_stride(&self, i: usize) -> Option<usize> {
+        if i >= self.plane_count as usize {
+            return None;
+        }
+        let stride = self.plane_strides[i];
+        (stride != 0).then_some(stride)
     }
 
     /// Frame header (width / height / pixel format / pts).

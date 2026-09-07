@@ -33,8 +33,8 @@ use std::collections::HashMap;
 use crate::arena;
 use crate::{
     CodecCapabilities, CodecId, CodecOptionsStruct, CodecParameters, CodecResolver, CodecTag,
-    Error, ExecutionContext, Frame, OptionField, Packet, PixelFormat, ProbeContext, ProbeFn,
-    Result,
+    Error, ExecutionContext, Frame, FrameLease, OptionField, Packet, PixelFormat, ProbeContext,
+    ProbeFn, Result,
 };
 
 // ───────────────────────── codec traits ─────────────────────────
@@ -62,6 +62,21 @@ pub trait Decoder: Send {
     /// Pull the next decoded frame, if any. Returns `Error::NeedMore` when the
     /// decoder needs another packet.
     fn receive_frame(&mut self) -> Result<Frame>;
+
+    /// Pull the next decoded frame as a retainable [`FrameLease`].
+    ///
+    /// This is the preferred API for asynchronous playback pipelines: a lease
+    /// can cross queues without cloning decoded media bytes and can preserve
+    /// arena-backed CPU storage or opaque hardware surfaces end-to-end.
+    ///
+    /// The default implementation wraps [`Self::receive_frame`] in the
+    /// lease's heap-backed compatibility variant, so every existing decoder
+    /// participates without an API break. Decoders that already own pooled CPU
+    /// storage or hardware surfaces should override this method and return that
+    /// native storage directly.
+    fn receive_frame_lease(&mut self) -> Result<FrameLease> {
+        self.receive_frame().map(FrameLease::from_frame)
+    }
 
     /// Pull the next decoded frame as an arena-backed [`arena::sync::Frame`].
     ///
