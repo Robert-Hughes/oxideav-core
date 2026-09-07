@@ -572,11 +572,12 @@ fn align_up(n: usize, align: usize) -> Option<usize> {
     n.checked_add(mask).map(|m| m & !mask)
 }
 
-/// Per-frame metadata carried alongside an [`Arena`] inside a
-/// [`Frame`]. Kept minimal in round 1; round 2 will extend with
-/// stride/colorspace/HDR fields as decoders need them.
+/// Per-frame metadata carried alongside an [`Arena`] inside a [`Frame`].
 ///
-/// `Copy` so it travels through the hot path with no allocation.
+/// Kept allocation-free so it travels through the hot path cheaply. Exact
+/// per-plane sample precision is stored alongside the container pixel format:
+/// for example an H.264 14-bit frame can use `Yuv420P16Le` storage while
+/// reporting `[14, 14, 14]` significant bits.
 #[non_exhaustive]
 #[derive(Copy, Clone, Debug)]
 pub struct FrameHeader {
@@ -589,12 +590,12 @@ pub struct FrameHeader {
     /// Presentation timestamp in stream time-base units. `None` when
     /// the codec did not surface one (e.g. a still image).
     pub presentation_timestamp: Option<i64>,
+    significant_bits: [u8; MAX_PLANES],
+    significant_bits_count: u8,
 }
 
 impl FrameHeader {
-    /// Construct a header with all four mandatory fields set. Use
-    /// functional-update syntax (`FrameHeader { ..header }`) to add
-    /// future fields safely.
+    /// Construct a header with all mandatory fields set.
     pub fn new(
         width: u32,
         height: u32,
@@ -606,7 +607,32 @@ impl FrameHeader {
             height,
             pixel_format,
             presentation_timestamp,
+            significant_bits: [0; MAX_PLANES],
+            significant_bits_count: 0,
         }
+    }
+
+    /// Attach exact per-plane significant-bit counts without allocating.
+    ///
+    /// Returns [`Error::InvalidData`] when more than [`MAX_PLANES`] entries are
+    /// supplied. An empty slice clears the metadata.
+    pub fn with_significant_bits(mut self, bits: &[u8]) -> Result<Self> {
+        if bits.len() > MAX_PLANES {
+            return Err(Error::invalid(format!(
+                "FrameHeader supports at most {MAX_PLANES} significant-bit entries (got {})",
+                bits.len()
+            )));
+        }
+        self.significant_bits = [0; MAX_PLANES];
+        self.significant_bits[..bits.len()].copy_from_slice(bits);
+        self.significant_bits_count = bits.len() as u8;
+        Ok(self)
+    }
+
+    /// Exact per-plane sample precision, when supplied by the producer.
+    pub fn significant_bits(&self) -> Option<&[u8]> {
+        let count = self.significant_bits_count as usize;
+        (count != 0).then_some(&self.significant_bits[..count])
     }
 }
 

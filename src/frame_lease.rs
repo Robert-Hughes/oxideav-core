@@ -295,10 +295,14 @@ fn materialize_arena_video(frame: &arena::sync::Frame) -> Result<VideoFrame> {
             data: data.to_vec(),
         });
     }
-    Ok(VideoFrame {
+    let mut video = VideoFrame {
         pts: header.presentation_timestamp,
         planes,
-    })
+    };
+    if let Some(bits) = header.significant_bits() {
+        video.set_significant_bits(bits.to_vec());
+    }
+    Ok(video)
 }
 
 #[cfg(test)]
@@ -349,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn arena_materialization_preserves_explicit_stride() {
+    fn arena_materialization_preserves_stride_and_significant_bits() {
         let pool = ArenaPool::new(1, 8);
         let arena = pool.lease().unwrap();
         arena
@@ -360,7 +364,9 @@ mod tests {
             arena,
             &[(0, 8)],
             &[4],
-            FrameHeader::new(2, 2, PixelFormat::Gray8, Some(3)),
+            FrameHeader::new(2, 2, PixelFormat::Gray8, Some(3))
+                .with_significant_bits(&[7])
+                .unwrap(),
         )
         .unwrap();
         let frame = FrameLease::from_arena_video(arena_frame)
@@ -371,6 +377,7 @@ mod tests {
         };
         assert_eq!(video.planes[0].stride, 4);
         assert_eq!(video.planes[0].data, [1, 2, 9, 9, 3, 4, 9, 9]);
+        assert_eq!(video.significant_bits(), Some(&[7][..]));
     }
 
     struct FakeHardwareFrame {

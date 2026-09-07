@@ -46,10 +46,11 @@
 //! `FrameHeader` shape, plane validation in [`FrameInner::new`])
 //! matches the parent module exactly.
 
+use std::marker::PhantomData;
 use std::mem::{align_of, size_of};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 
 use crate::error::{Error, Result};
 
@@ -69,11 +70,13 @@ use super::{Buffer, MAX_ALIGN};
 /// behaviour; the only difference is that the [`Arena`] (and the
 /// [`Frame`] holding it) handed out are themselves `Send + Sync`.
 ///
-/// Construct via [`ArenaPool::new`]. Lease an [`Arena`] per frame via
-/// [`ArenaPool::lease`]; drop the arena (or drop the last clone of a
-/// [`Frame`] holding it) to return its buffer to the pool.
+/// Construct via [`ArenaPool::new`]. [`ArenaPool::lease`] remains
+/// non-blocking; realtime producer/consumer paths can opt into
+/// [`ArenaPool::lease_wait`] and sleep until a retained frame returns a
+/// slot to the pool.
 pub struct ArenaPool {
     inner: Mutex<PoolInner>,
+    available: Condvar,
     cap_per_arena: usize,
     max_arenas: usize,
     max_alloc_count_per_arena: u32,
@@ -111,6 +114,7 @@ impl ArenaPool {
                 idle: Vec::with_capacity(max_arenas),
                 total_allocated: 0,
             }),
+            available: Condvar::new(),
             cap_per_arena,
             max_arenas,
             max_alloc_count_per_arena,
@@ -127,9 +131,21 @@ impl ArenaPool {
         self.max_arenas
     }
 
-    /// Lease one arena from the pool. Returns
-    /// [`Error::ResourceExhausted`] if every arena slot is already
-    /// checked out by an [`Arena`] (or a [`Frame`] holding one).
+    fn arena_from_buffer(self: &Arc<Self>, buffer: Buffer) -> Arena {
+        let base = buffer.ptr;
+        Arena {
+            buffer: Mutex::new(Some(buffer)),
+            base,
+            cursor: AtomicUsize::new(0),
+            alloc_count: AtomicU32::new(0),
+            cap: self.cap_per_arena,
+            alloc_count_cap: self.max_alloc_count_per_arena,
+            pool: Arc::downgrade(self),
+        }
+    }
+
+    /// Lease one arena from the pool without blocking. Returns
+    /// [`Error::ResourceExhausted`] if every arena slot is already checked out.
     pub fn lease(self: &Arc<Self>) -> Result<Arena> {
         let buffer = {
             let mut inner = self.inner.lock().expect("ArenaPool mutex poisoned");
@@ -145,31 +161,50 @@ impl ArenaPool {
                 )));
             }
         };
-
-        let base = buffer.ptr;
-        Ok(Arena {
-            buffer: Mutex::new(Some(buffer)),
-            base,
-            cursor: AtomicUsize::new(0),
-            alloc_count: AtomicU32::new(0),
-            cap: self.cap_per_arena,
-            alloc_count_cap: self.max_alloc_count_per_arena,
-            pool: Arc::downgrade(self),
-        })
+        Ok(self.arena_from_buffer(buffer))
     }
 
-    /// Return a buffer to the idle list. Called from `Arena::Drop`;
-    /// not part of the public API. The buffer is zeroed before being
-    /// returned so the next lease starts from a clean state — this is
-    /// what makes `Zeroable` a sufficient bound on `Arena::alloc<T>`
-    /// across pool reuse cycles.
+    /// Lease one arena, waiting until a retained frame returns a pool slot.
+    ///
+    /// This is intended for decode threads feeding an independent consumer. It
+    /// provides bounded-memory backpressure without turning temporary renderer
+    /// lag into a decode error. Callers that cannot allow the current thread to
+    /// sleep should keep using [`Self::lease`]. A zero-sized pool is rejected
+    /// immediately because it can never make progress.
+    pub fn lease_wait(self: &Arc<Self>) -> Result<Arena> {
+        if self.max_arenas == 0 {
+            return Err(Error::resource_exhausted(
+                "ArenaPool has zero slots and cannot satisfy lease_wait".to_string(),
+            ));
+        }
+        let mut inner = self.inner.lock().expect("ArenaPool mutex poisoned");
+        loop {
+            if let Some(buffer) = inner.idle.pop() {
+                drop(inner);
+                return Ok(self.arena_from_buffer(buffer));
+            }
+            if inner.total_allocated < self.max_arenas {
+                inner.total_allocated += 1;
+                drop(inner);
+                return Ok(self.arena_from_buffer(Buffer::new_zeroed(self.cap_per_arena)));
+            }
+            inner = self
+                .available
+                .wait(inner)
+                .expect("ArenaPool mutex poisoned while waiting");
+        }
+    }
+
+    /// Return a buffer to the idle list. Called from `Arena::Drop`.
     fn release(&self, mut buffer: Buffer) {
         buffer.zero();
         if let Ok(mut inner) = self.inner.lock() {
             inner.idle.push(buffer);
+            drop(inner);
+            self.available.notify_one();
         }
-        // If the lock is poisoned, drop the buffer normally — the
-        // pool is in an unusable state already.
+        // If the lock is poisoned, drop the buffer normally — the pool is
+        // already unusable and waking another waiter would not help.
     }
 }
 
@@ -464,6 +499,128 @@ fn align_up(n: usize, align: usize) -> Option<usize> {
     debug_assert!(align.is_power_of_two(), "alignment must be a power of two");
     let mask = align - 1;
     n.checked_add(mask).map(|m| m & !mask)
+}
+
+/// Mutable typed view over one arena while a decoder constructs a video frame.
+///
+/// Plane storage is allocated once at construction. The builder then owns the
+/// arena and exposes random read/write access through `&self` / `&mut self`
+/// without retaining self-referential slices. [`Self::freeze`] consumes the
+/// mutable builder and turns the exact same allocation into an immutable
+/// refcounted [`Frame`]; no plane bytes are copied.
+pub struct VideoFrameBuilder<T: bytemuck::Pod> {
+    arena: Arena,
+    plane_offsets: [(usize, usize); MAX_PLANES],
+    plane_elements: [usize; MAX_PLANES],
+    plane_strides: [usize; MAX_PLANES],
+    plane_count: u8,
+    marker: PhantomData<T>,
+}
+
+impl<T: bytemuck::Pod> VideoFrameBuilder<T> {
+    /// Allocate all image planes from `arena` up front.
+    ///
+    /// `plane_elements` are counts of `T`, while `plane_strides` are byte
+    /// strides. The arrays must have the same length and at most [`MAX_PLANES`]
+    /// entries. The allocated storage starts zero-filled and remains exclusively
+    /// mutable through this builder until `freeze`.
+    pub fn new(arena: Arena, plane_elements: &[usize], plane_strides: &[usize]) -> Result<Self> {
+        if plane_elements.len() > MAX_PLANES {
+            return Err(Error::invalid(format!(
+                "VideoFrameBuilder supports at most {MAX_PLANES} planes (got {})",
+                plane_elements.len()
+            )));
+        }
+        if plane_elements.len() != plane_strides.len() {
+            return Err(Error::invalid(format!(
+                "VideoFrameBuilder stride count {} does not match plane count {}",
+                plane_strides.len(),
+                plane_elements.len()
+            )));
+        }
+
+        let mut offsets = [(0usize, 0usize); MAX_PLANES];
+        let mut elements = [0usize; MAX_PLANES];
+        let mut strides = [0usize; MAX_PLANES];
+        let base = arena.base.as_ptr() as usize;
+        for (index, (&count, &stride)) in
+            plane_elements.iter().zip(plane_strides.iter()).enumerate()
+        {
+            let allocated = arena.alloc::<T>(count)?;
+            let ptr = allocated.as_ptr() as usize;
+            let offset = ptr.checked_sub(base).ok_or_else(|| {
+                Error::invalid("VideoFrameBuilder plane pointer precedes arena base".to_string())
+            })?;
+            let bytes = count.checked_mul(size_of::<T>()).ok_or_else(|| {
+                Error::resource_exhausted("video plane byte size overflow".to_string())
+            })?;
+            offsets[index] = (offset, bytes);
+            elements[index] = count;
+            strides[index] = stride;
+        }
+
+        Ok(Self {
+            arena,
+            plane_offsets: offsets,
+            plane_elements: elements,
+            plane_strides: strides,
+            plane_count: plane_elements.len() as u8,
+            marker: PhantomData,
+        })
+    }
+
+    /// Number of image planes owned by this builder.
+    pub fn plane_count(&self) -> usize {
+        self.plane_count as usize
+    }
+
+    /// Read one typed plane while reconstruction is in progress.
+    pub fn plane(&self, index: usize) -> Option<&[T]> {
+        if index >= self.plane_count() {
+            return None;
+        }
+        let (offset, _) = self.plane_offsets[index];
+        let len = self.plane_elements[index];
+        // SAFETY: `new` allocated this range as `T`, all plane ranges are
+        // disjoint, and the builder retains the arena for this borrow's life.
+        Some(unsafe {
+            std::slice::from_raw_parts(self.arena.base.as_ptr().add(offset).cast::<T>(), len)
+        })
+    }
+
+    /// Mutably access one typed plane while reconstruction is in progress.
+    pub fn plane_mut(&mut self, index: usize) -> Option<&mut [T]> {
+        if index >= self.plane_count() {
+            return None;
+        }
+        let (offset, _) = self.plane_offsets[index];
+        let len = self.plane_elements[index];
+        // SAFETY: `&mut self` provides exclusive access to every plane exposed
+        // by this builder, and `new` allocated the range as aligned `T` values.
+        Some(unsafe {
+            std::slice::from_raw_parts_mut(self.arena.base.as_ptr().add(offset).cast::<T>(), len)
+        })
+    }
+
+    /// Byte stride supplied for one plane.
+    pub fn plane_stride(&self, index: usize) -> Option<usize> {
+        (index < self.plane_count()).then_some(self.plane_strides[index])
+    }
+
+    /// Freeze reconstruction storage into an immutable refcounted frame.
+    ///
+    /// The returned frame owns the same arena and therefore the same plane
+    /// addresses. Clones only retain the arena; the buffer returns to its pool
+    /// after the final clone is dropped.
+    pub fn freeze(self, header: FrameHeader) -> Result<Frame> {
+        let count = self.plane_count();
+        FrameInner::new_with_strides(
+            self.arena,
+            &self.plane_offsets[..count],
+            &self.plane_strides[..count],
+            header,
+        )
+    }
 }
 
 /// The owned body of a refcounted [`Frame`]. `Send + Sync`.
@@ -877,6 +1034,71 @@ mod tests {
         // Disjoint ranges: [p1, p1+l1) and [p2, p2+l2) do not overlap.
         let no_overlap = p1 + l1 <= p2 || p2 + l2 <= p1;
         assert!(no_overlap, "concurrent alloc returned overlapping slices");
+    }
+
+    #[test]
+    fn video_builder_freezes_same_allocation_without_copy() {
+        let pool = small_pool(1, 64);
+        let arena = pool.lease().unwrap();
+        let mut builder = VideoFrameBuilder::<u8>::new(arena, &[8], &[4]).unwrap();
+        let before = builder.plane(0).unwrap().as_ptr();
+        builder
+            .plane_mut(0)
+            .unwrap()
+            .copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let frame = builder
+            .freeze(FrameHeader::new(4, 2, PixelFormat::Gray8, Some(9)))
+            .unwrap();
+        let after = frame.plane(0).unwrap();
+        assert_eq!(after.as_ptr(), before);
+        assert_eq!(after, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(frame.plane_stride(0), Some(4));
+    }
+
+    #[test]
+    fn video_builder_supports_typed_u16_storage() {
+        let pool = small_pool(1, 64);
+        let arena = pool.lease().unwrap();
+        let mut builder = VideoFrameBuilder::<u16>::new(arena, &[4], &[4]).unwrap();
+        builder
+            .plane_mut(0)
+            .unwrap()
+            .copy_from_slice(&[0x0123, 0x0234, 0x0345, 0x0456]);
+        let frame = builder
+            .freeze(
+                FrameHeader::new(2, 2, PixelFormat::Yuv420P10Le, None)
+                    .with_significant_bits(&[10])
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(frame.header().significant_bits(), Some(&[10][..]));
+        assert_eq!(frame.plane(0).unwrap().len(), 8);
+        assert_eq!(frame.plane_stride(0), Some(4));
+    }
+
+    #[test]
+    fn lease_wait_unblocks_when_last_owner_returns_buffer() {
+        let pool = small_pool(1, 16);
+        let held = pool.lease().unwrap();
+        let waiter_pool = Arc::clone(&pool);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let arena = waiter_pool.lease_wait().unwrap();
+            done_tx.send(arena.capacity()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(done_rx.try_recv().is_err());
+        drop(held);
+        assert_eq!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            16
+        );
+        handle.join().unwrap();
     }
 
     #[cfg(miri)]
