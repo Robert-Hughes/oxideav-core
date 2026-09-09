@@ -49,8 +49,11 @@
 use std::marker::PhantomData;
 use std::mem::{align_of, size_of};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
+
+use crate::execution::CancellationWaker;
+use crate::CancellationToken;
 
 use crate::error::{Error, Result};
 
@@ -65,6 +68,18 @@ pub use super::{FrameHeader, MAX_PLANES};
 // for the full soundness rationale.
 use super::{Buffer, MAX_ALIGN};
 
+/// Opaque identity of one checked-out arena allocation.
+///
+/// The value is only for ownership/deadlock accounting; callers must not infer
+/// address layout or dereference either component.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ArenaIdentity {
+    pool_generation: u64,
+    allocation: usize,
+}
+
+static NEXT_POOL_GENERATION: AtomicU64 = AtomicU64::new(1);
+
 /// `Send + Sync` pool of reusable byte buffers for arena-backed frame
 /// allocations. Mirrors [`crate::arena::ArenaPool`] in shape and
 /// behaviour; the only difference is that the [`Arena`] (and the
@@ -75,8 +90,9 @@ use super::{Buffer, MAX_ALIGN};
 /// [`ArenaPool::lease_wait`] and sleep until a retained frame returns a
 /// slot to the pool.
 pub struct ArenaPool {
+    generation: u64,
     inner: Mutex<PoolInner>,
-    available: Condvar,
+    available: Arc<Condvar>,
     cap_per_arena: usize,
     max_arenas: usize,
     max_alloc_count_per_arena: u32,
@@ -109,12 +125,15 @@ impl ArenaPool {
         cap_per_arena: usize,
         max_alloc_count_per_arena: u32,
     ) -> Arc<Self> {
+        let generation = NEXT_POOL_GENERATION.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(generation, 0, "ArenaPool generation space exhausted");
         Arc::new(Self {
+            generation,
             inner: Mutex::new(PoolInner {
                 idle: Vec::with_capacity(max_arenas),
                 total_allocated: 0,
             }),
-            available: Condvar::new(),
+            available: Arc::new(Condvar::new()),
             cap_per_arena,
             max_arenas,
             max_alloc_count_per_arena,
@@ -131,6 +150,17 @@ impl ArenaPool {
         self.max_arenas
     }
 
+    /// Number of arena buffers currently checked out from this pool.
+    pub fn checked_out_count(&self) -> usize {
+        let inner = self.inner.lock().expect("ArenaPool mutex poisoned");
+        inner.total_allocated.saturating_sub(inner.idle.len())
+    }
+
+    /// Whether an opaque arena identity belongs to this pool.
+    pub fn owns_identity(self: &Arc<Self>, identity: ArenaIdentity) -> bool {
+        identity.pool_generation == self.generation
+    }
+
     fn arena_from_buffer(self: &Arc<Self>, buffer: Buffer) -> Arena {
         let base = buffer.ptr;
         Arena {
@@ -140,6 +170,7 @@ impl ArenaPool {
             alloc_count: AtomicU32::new(0),
             cap: self.cap_per_arena,
             alloc_count_cap: self.max_alloc_count_per_arena,
+            pool_generation: self.generation,
             pool: Arc::downgrade(self),
         }
     }
@@ -166,19 +197,35 @@ impl ArenaPool {
 
     /// Lease one arena, waiting until a retained frame returns a pool slot.
     ///
-    /// This is intended for decode threads feeding an independent consumer. It
-    /// provides bounded-memory backpressure without turning temporary renderer
-    /// lag into a decode error. Callers that cannot allow the current thread to
-    /// sleep should keep using [`Self::lease`]. A zero-sized pool is rejected
-    /// immediately because it can never make progress.
+    /// This uncancellable compatibility form is appropriate only when the
+    /// caller has another guaranteed progress path. Executors that can abort
+    /// should use [`Self::lease_wait_cancellable`].
     pub fn lease_wait(self: &Arc<Self>) -> Result<Arena> {
+        self.lease_wait_inner(None)
+    }
+
+    /// Lease one arena, waiting for either a returned slot or cancellation.
+    ///
+    /// Cancellation registers this pool as a wake target on `token`. The token
+    /// takes the pool mutex before notifying the condition variable, closing
+    /// the usual check-before-wait lost-wakeup race without polling timeouts.
+    pub fn lease_wait_cancellable(self: &Arc<Self>, token: &CancellationToken) -> Result<Arena> {
+        let waker: Arc<dyn CancellationWaker> = self.clone();
+        token.register_waker(&waker);
+        self.lease_wait_inner(Some(token))
+    }
+
+    fn lease_wait_inner(self: &Arc<Self>, token: Option<&CancellationToken>) -> Result<Arena> {
         if self.max_arenas == 0 {
             return Err(Error::resource_exhausted(
-                "ArenaPool has zero slots and cannot satisfy lease_wait".to_string(),
+                "ArenaPool has zero slots and cannot satisfy a blocking lease".to_string(),
             ));
         }
         let mut inner = self.inner.lock().expect("ArenaPool mutex poisoned");
         loop {
+            if token.is_some_and(CancellationToken::is_cancelled) {
+                return Err(Error::cancelled("arena lease wait cancelled"));
+            }
             if let Some(buffer) = inner.idle.pop() {
                 drop(inner);
                 return Ok(self.arena_from_buffer(buffer));
@@ -205,6 +252,25 @@ impl ArenaPool {
         }
         // If the lock is poisoned, drop the buffer normally — the pool is
         // already unusable and waking another waiter would not help.
+    }
+}
+
+impl CancellationWaker for ArenaPool {
+    fn cancellation_waker_id(&self) -> usize {
+        self as *const Self as usize
+    }
+
+    fn wake_for_cancellation(&self) {
+        // Synchronise with the waiter's check-before-wait critical section.
+        // Once this lock is acquired, a waiter that observed "not cancelled"
+        // must already be asleep in `Condvar::wait`, so the notification cannot
+        // be lost.
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.available.notify_all();
+        drop(guard);
     }
 }
 
@@ -254,6 +320,8 @@ pub struct Arena {
     cap: usize,
     /// Cached cap (== `pool.max_alloc_count_per_arena` at lease time).
     alloc_count_cap: u32,
+    /// Stable generation of the pool that leased this arena.
+    pool_generation: u64,
     /// Weak handle back to the pool so `Drop` can return the buffer.
     pool: Weak<ArenaPool>,
 }
@@ -273,6 +341,16 @@ unsafe impl Send for Arena {}
 // call cannot invalidate any other thread's previously returned
 // `&mut [T]` slice under stacked borrows.
 unsafe impl Sync for Arena {}
+
+impl Arena {
+    /// Opaque identity used to deduplicate retained allocations.
+    pub fn identity(&self) -> ArenaIdentity {
+        ArenaIdentity {
+            pool_generation: self.pool_generation,
+            allocation: self.base.as_ptr() as usize,
+        }
+    }
+}
 
 impl Arena {
     /// Capacity of this arena in bytes.
@@ -569,6 +647,11 @@ impl<T: bytemuck::Pod> VideoFrameBuilder<T> {
         })
     }
 
+    /// Opaque identity of the arena backing this builder.
+    pub fn arena_identity(&self) -> ArenaIdentity {
+        self.arena.identity()
+    }
+
     /// Number of image planes owned by this builder.
     pub fn plane_count(&self) -> usize {
         self.plane_count as usize
@@ -655,6 +738,11 @@ pub struct FrameInner {
 pub type Frame = Arc<FrameInner>;
 
 impl FrameInner {
+    /// Opaque identity of the arena backing this frame.
+    pub fn arena_identity(&self) -> ArenaIdentity {
+        self.arena.identity()
+    }
+
     /// Construct a `Frame` (`Arc<FrameInner>`) from an arena, a slice
     /// of `(offset, length)` plane descriptors, and a header.
     ///
@@ -1004,6 +1092,70 @@ mod tests {
         assert_eq!(sum, (0..16u32).sum::<u32>());
         // Original frame still readable here too.
         assert_eq!(frame.plane(0).unwrap().len(), 16);
+    }
+
+    #[test]
+    fn cancellable_wait_returns_cancelled_without_releasing_retained_arena() {
+        let pool = small_pool(1, 64);
+        let retained = pool.lease().expect("retain only slot");
+        let token = CancellationToken::new();
+        let worker_pool = Arc::clone(&pool);
+        let worker_token = token.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(worker_pool.lease_wait_cancellable(&worker_token))
+                .expect("send wait result");
+        });
+
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_millis(30))
+            .is_err());
+        token.cancel();
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("cancelled waiter must wake promptly");
+        assert!(matches!(result, Err(Error::Cancelled(_))));
+        assert_eq!(pool.checked_out_count(), 1);
+        drop(retained);
+        worker.join().expect("wait worker");
+    }
+
+    #[test]
+    fn pre_cancelled_wait_returns_immediately() {
+        let pool = small_pool(1, 64);
+        let _retained = pool.lease().expect("retain only slot");
+        let token = CancellationToken::new();
+        token.cancel();
+        assert!(matches!(
+            pool.lease_wait_cancellable(&token),
+            Err(Error::Cancelled(_))
+        ));
+    }
+
+    #[test]
+    fn arena_identity_tracks_pool_and_allocation() {
+        let a_pool = small_pool(2, 64);
+        let b_pool = small_pool(1, 64);
+        let a1 = a_pool.lease().unwrap();
+        let a2 = a_pool.lease().unwrap();
+        let b1 = b_pool.lease().unwrap();
+        assert!(a_pool.owns_identity(a1.identity()));
+        assert!(a_pool.owns_identity(a2.identity()));
+        assert!(!a_pool.owns_identity(b1.identity()));
+        assert_ne!(a1.identity(), a2.identity());
+        assert_eq!(a_pool.checked_out_count(), 2);
+    }
+
+    #[test]
+    fn arena_identity_does_not_alias_replacement_pool() {
+        let old_pool = small_pool(1, 64);
+        let retained = old_pool.lease().expect("old arena");
+        let identity = retained.identity();
+        drop(old_pool);
+
+        let replacement = small_pool(1, 64);
+        assert_eq!(retained.identity(), identity);
+        assert!(!replacement.owns_identity(identity));
     }
 
     #[test]

@@ -18,6 +18,8 @@
 //!   probe/lookup misses.
 //! * [`Error::ResourceExhausted`] — a configured cap or pool limit
 //!   fired; hard-reject the input or back off, never retry blindly.
+//! * [`Error::Cancelled`] — the caller requested cooperative shutdown; stop
+//!   promptly without treating the media as corrupt.
 //! * [`Error::Io`] / [`Error::Other`] — transport problems and
 //!   everything else.
 
@@ -67,6 +69,12 @@ pub enum Error {
     #[error("resource exhausted: {0}")]
     ResourceExhausted(String),
 
+    /// Cooperative cancellation requested by the caller. Blocking decoder
+    /// operations should surface this immediately so the pipeline can unwind
+    /// without treating cancellation as malformed media.
+    #[error("cancelled: {0}")]
+    Cancelled(String),
+
     /// Anything that doesn't fit the other variants; the message
     /// carries the whole story.
     #[error("{0}")]
@@ -87,6 +95,11 @@ impl Error {
     /// Construct an [`Error::Other`] with the given message.
     pub fn other(msg: impl Into<String>) -> Self {
         Self::Other(msg.into())
+    }
+
+    /// Construct an [`Error::Cancelled`] with the given message.
+    pub fn cancelled(msg: impl Into<String>) -> Self {
+        Self::Cancelled(msg.into())
     }
 
     /// Construct a [`Error::ResourceExhausted`] with the given message.
@@ -120,6 +133,11 @@ impl Error {
     /// bytes and retry" signal.
     pub fn is_need_more(&self) -> bool {
         matches!(self, Self::NeedMore)
+    }
+
+    /// `true` for [`Error::Cancelled`].
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled(_))
     }
 
     /// `true` for [`Error::ResourceExhausted`] — the "DoS cap fired"
@@ -157,6 +175,7 @@ mod tests {
             Error::resource_exhausted("pool"),
             Error::ResourceExhausted(s) if s == "pool"
         ));
+        assert!(matches!(Error::cancelled("stop"), Error::Cancelled(s) if s == "stop"));
     }
 
     #[test]
@@ -168,6 +187,7 @@ mod tests {
         assert!(Error::Eof.is_starved());
         assert!(Error::NeedMore.is_starved());
         assert!(Error::resource_exhausted("x").is_resource_exhausted());
+        assert!(Error::cancelled("x").is_cancelled());
         for e in [
             Error::invalid("bad"),
             Error::unsupported("feature"),
@@ -179,6 +199,7 @@ mod tests {
             assert!(!e.is_need_more());
             assert!(!e.is_starved());
             assert!(!e.is_resource_exhausted());
+            assert!(!e.is_cancelled());
         }
     }
 

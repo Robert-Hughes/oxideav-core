@@ -1,4 +1,4 @@
-//! Runtime hints passed from the executor to codecs and filters.
+//! Runtime hints and cancellation primitives shared by executors and codecs.
 //!
 //! An [`ExecutionContext`] carries advisory information — today only a
 //! thread budget — that codecs can use to tune their internal
@@ -21,6 +21,108 @@
 //!   simply keeps the default no-op trait method, and callers must
 //!   always work with a codec that runs serial regardless of the budget
 //!   they granted.
+
+/// Shared cancellation signal for long-running or blocking codec operations.
+///
+/// Cancellation is monotonic: once cancelled, a token remains cancelled. In
+/// addition to the atomic flag, the token keeps weak registrations for blocking
+/// waiters so cancellation can wake them immediately rather than relying on
+/// polling timeouts.
+#[derive(Clone)]
+pub struct CancellationToken {
+    inner: std::sync::Arc<CancellationInner>,
+}
+
+struct CancellationInner {
+    cancelled: std::sync::atomic::AtomicBool,
+    wakers: std::sync::Mutex<Vec<(usize, std::sync::Weak<dyn CancellationWaker>)>>,
+}
+
+pub(crate) trait CancellationWaker: Send + Sync {
+    fn cancellation_waker_id(&self) -> usize;
+    fn wake_for_cancellation(&self);
+}
+
+impl std::fmt::Debug for CancellationToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CancellationToken")
+            .field("cancelled", &self.is_cancelled())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for CancellationToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CancellationToken {
+    /// Create a fresh, non-cancelled token.
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Arc::new(CancellationInner {
+                cancelled: std::sync::atomic::AtomicBool::new(false),
+                wakers: std::sync::Mutex::new(Vec::new()),
+            }),
+        }
+    }
+
+    /// Return whether cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.inner
+            .cancelled
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Request cancellation and wake every registered blocking waiter.
+    pub fn cancel(&self) {
+        self.inner
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let wakers = {
+            let mut registrations = self
+                .inner
+                .wakers
+                .lock()
+                .expect("cancellation wakers poisoned");
+            let mut live = Vec::with_capacity(registrations.len());
+            registrations.retain(|(_, weak)| {
+                if let Some(waker) = weak.upgrade() {
+                    live.push(waker);
+                    true
+                } else {
+                    false
+                }
+            });
+            live
+        };
+        for waker in wakers {
+            waker.wake_for_cancellation();
+        }
+    }
+
+    pub(crate) fn register_waker(&self, waker: &std::sync::Arc<dyn CancellationWaker>) {
+        let id = waker.cancellation_waker_id();
+        {
+            let mut registrations = self
+                .inner
+                .wakers
+                .lock()
+                .expect("cancellation wakers poisoned");
+            registrations.retain(|(_, weak)| weak.strong_count() > 0);
+            if !registrations.iter().any(|(existing, _)| *existing == id) {
+                registrations.push((id, std::sync::Arc::downgrade(waker)));
+            }
+        }
+        // Close the registration/cancel race: if cancellation happened after
+        // the caller's initial check but before registration completed, wake
+        // this waiter now as well.
+        if self.is_cancelled() {
+            waker.wake_for_cancellation();
+        }
+    }
+}
 
 /// Advisory runtime information handed to a codec after construction.
 ///
@@ -85,7 +187,17 @@ impl Default for ExecutionContext {
 
 #[cfg(test)]
 mod tests {
-    use super::ExecutionContext;
+    use super::{CancellationToken, ExecutionContext};
+
+    #[test]
+    fn cancellation_token_is_monotonic() {
+        let token = CancellationToken::new();
+        assert!(!token.is_cancelled());
+        token.cancel();
+        assert!(token.is_cancelled());
+        token.cancel();
+        assert!(token.is_cancelled());
+    }
 
     #[test]
     fn serial_is_one_thread_and_default() {

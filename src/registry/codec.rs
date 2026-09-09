@@ -32,9 +32,9 @@ use std::collections::HashMap;
 
 use crate::arena;
 use crate::{
-    CodecCapabilities, CodecId, CodecOptionsStruct, CodecParameters, CodecResolver, CodecTag,
-    Error, ExecutionContext, Frame, FrameLease, OptionField, Packet, PixelFormat, ProbeContext,
-    ProbeFn, Result,
+    CancellationToken, CodecCapabilities, CodecId, CodecOptionsStruct, CodecParameters,
+    CodecResolver, CodecTag, Error, ExecutionContext, Frame, FrameLease, OptionField, Packet,
+    PixelFormat, ProbeContext, ProbeFn, Result,
 };
 
 // ───────────────────────── codec traits ─────────────────────────
@@ -158,6 +158,13 @@ pub trait Decoder: Send {
     /// Ignoring the hint is always safe — callers must still work with
     /// a decoder that runs serial.
     fn set_execution_context(&mut self, _ctx: &ExecutionContext) {}
+
+    /// Provide the cooperative cancellation token for blocking decoder work.
+    ///
+    /// Executors call this before any packet reaches the decoder. Codecs that
+    /// never block may ignore it. A blocking codec should return
+    /// [`Error::Cancelled`] promptly when the token is cancelled.
+    fn set_cancellation_token(&mut self, _token: CancellationToken) {}
 }
 
 /// A frame-to-packet encoder.

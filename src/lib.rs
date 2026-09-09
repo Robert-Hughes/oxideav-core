@@ -33,7 +33,7 @@ pub mod vector;
 pub use capabilities::{CodecCapabilities, DEFAULT_PRIORITY};
 pub use engine::{EngineProbeFn, HwCodecCaps, HwDeviceInfo};
 pub use error::{Error, Result};
-pub use execution::ExecutionContext;
+pub use execution::{CancellationToken, ExecutionContext};
 pub use filter::{FilterContext, PortParams, PortSpec, StreamFilter};
 pub use format::{
     ChannelLayout, ChannelPosition, MediaType, ParseChannelLayoutError, PixelFormat, SampleFormat,
