@@ -54,6 +54,20 @@ pub trait PacketSource: Send {
     /// end of stream.
     fn next_packet(&mut self) -> Result<Packet>;
 
+    /// Seek to the nearest decode-safe point at or before `pts`, expressed
+    /// in the selected stream's time base. A successful return means the
+    /// source has changed its internal read position and the next
+    /// [`Self::next_packet`] continues from that landing point. Returns the
+    /// actual landed timestamp in the same time base.
+    ///
+    /// Packet sources that are inherently sequential (live RTMP, RTP, etc.)
+    /// keep the default unsupported implementation.
+    fn seek_to(&mut self, _stream_index: u32, _pts: i64) -> Result<i64> {
+        Err(Error::unsupported(
+            "this packet source does not support seeking",
+        ))
+    }
+
     /// Source-level metadata as ordered (key, value) pairs. Default is
     /// empty.
     fn metadata(&self) -> &[(String, String)] {
@@ -405,6 +419,19 @@ mod tests {
 
     fn open_packets_mock(_uri: &str) -> Result<Box<dyn PacketSource>> {
         Ok(Box::new(MockPacketSource::new()))
+    }
+
+    #[test]
+    fn packet_source_seek_is_unsupported_by_default() {
+        let mut source = MockPacketSource::new();
+        assert!(matches!(
+            source.seek_to(0, 1_000),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(
+            !source.emitted,
+            "a rejected seek must not move sequential state"
+        );
     }
 
     #[test]
