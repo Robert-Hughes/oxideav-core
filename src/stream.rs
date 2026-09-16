@@ -323,6 +323,55 @@ impl CodecResolver for NullCodecResolver {
     }
 }
 
+/// Nominal decoded-video sample range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoColorRange {
+    /// Studio/limited range (for 8-bit Y'CbCr, nominal Y 16-235 and Cb/Cr 16-240).
+    Limited,
+    /// Full-range samples spanning the complete code-value range.
+    Full,
+}
+
+/// Y'CbCr-to-R'G'B' matrix signalled by the compressed video stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoMatrixCoefficients {
+    /// Identity / GBR ordering (matrix coefficient code 0).
+    Identity,
+    /// ITU-R BT.709.
+    Bt709,
+    /// Matrix not specified by the stream.
+    Unspecified,
+    /// FCC 73.682.
+    Fcc,
+    /// ITU-R BT.470 System B/G.
+    Bt470Bg,
+    /// SMPTE 170M / BT.601 family.
+    Smpte170M,
+    /// SMPTE 240M.
+    Smpte240M,
+    /// YCgCo.
+    Ycgco,
+    /// BT.2020 non-constant luminance.
+    Bt2020Ncl,
+    /// BT.2020 constant luminance.
+    Bt2020Cl,
+    /// A signalled code not recognised by this version of the framework.
+    Unknown(u8),
+}
+
+/// Stream-level colour metadata carried from the codec bitstream to presentation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VideoColorInfo {
+    /// Nominal sample range when explicitly known.
+    pub range: Option<VideoColorRange>,
+    /// Y'CbCr matrix coefficients when explicitly known.
+    pub matrix: Option<VideoMatrixCoefficients>,
+    /// Raw ITU-T H.273 / H.264 `colour_primaries` code when signalled.
+    pub colour_primaries: Option<u8>,
+    /// Raw ITU-T H.273 / H.264 `transfer_characteristics` code when signalled.
+    pub transfer_characteristics: Option<u8>,
+}
+
 /// Codec-level parameters shared between demuxer/muxer and en/decoder.
 ///
 /// **Marked `#[non_exhaustive]`** — construction via struct-literal
@@ -370,6 +419,8 @@ pub struct CodecParameters {
     /// Video: nominal frame rate in frames per second, as a rational
     /// (e.g. 30000/1001). `None` when unknown or variable.
     pub frame_rate: Option<Rational>,
+    /// Video colour/range metadata discovered from the codec/container.
+    pub video_color: Option<VideoColorInfo>,
 
     /// Per-codec setup bytes (e.g., SPS/PPS, OpusHead). Format defined by codec.
     pub extradata: Vec<u8>,
@@ -458,6 +509,7 @@ impl CodecParameters {
             height: None,
             pixel_format: None,
             frame_rate: None,
+            video_color: None,
             extradata: Vec::new(),
             bit_rate: None,
             options: CodecOptions::default(),
@@ -484,6 +536,7 @@ impl CodecParameters {
             && self.width == other.width
             && self.height == other.height
             && self.pixel_format == other.pixel_format
+            && self.video_color == other.video_color
     }
 
     /// Construct video codec parameters with every optional field
@@ -501,6 +554,7 @@ impl CodecParameters {
             height: None,
             pixel_format: None,
             frame_rate: None,
+            video_color: None,
             extradata: Vec::new(),
             bit_rate: None,
             options: CodecOptions::default(),
@@ -527,6 +581,7 @@ impl CodecParameters {
             height: None,
             pixel_format: None,
             frame_rate: None,
+            video_color: None,
             extradata: Vec::new(),
             bit_rate: None,
             options: CodecOptions::default(),
@@ -552,6 +607,7 @@ impl CodecParameters {
             height: None,
             pixel_format: None,
             frame_rate: None,
+            video_color: None,
             extradata: Vec::new(),
             bit_rate: None,
             options: CodecOptions::default(),

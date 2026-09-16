@@ -58,7 +58,7 @@ pub use registry::{
 };
 pub use stream::{
     CodecId, CodecParameters, CodecResolver, CodecTag, Confidence, NullCodecResolver, ProbeContext,
-    ProbeFn, StreamInfo,
+    ProbeFn, StreamInfo, VideoColorInfo, VideoColorRange, VideoMatrixCoefficients,
 };
 pub use subtitle::{CuePosition, Segment, SubtitleCue, SubtitleStyle, TextAlign};
 pub use time::{rescale, rescale_checked, rescale_rnd, Rounding, TimeBase, Timestamp};
