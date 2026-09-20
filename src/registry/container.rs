@@ -38,6 +38,12 @@ pub trait Demuxer: Send {
         Err(Error::unsupported("this demuxer does not support seeking"))
     }
 
+    /// Whether this demuxer supports repositioning with [`Self::seek_to`].
+    /// Defaults to `false`; seekable demuxers must opt in explicitly.
+    fn supports_seek(&self) -> bool {
+        false
+    }
+
     /// Container-level metadata as ordered (key, value) pairs.
     /// Keys follow a loose convention borrowed from Vorbis comments:
     /// `title`, `artist`, `album`, `comment`, `date`, `sample_name:<n>`,

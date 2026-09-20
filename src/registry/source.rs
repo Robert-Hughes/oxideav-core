@@ -68,6 +68,12 @@ pub trait PacketSource: Send {
         ))
     }
 
+    /// Whether this packet source supports repositioning with [`Self::seek_to`].
+    /// Defaults to `false`; seekable packet sources must opt in explicitly.
+    fn supports_seek(&self) -> bool {
+        false
+    }
+
     /// Source-level metadata as ordered (key, value) pairs. Default is
     /// empty.
     fn metadata(&self) -> &[(String, String)] {
