@@ -122,8 +122,77 @@ impl CancellationToken {
             waker.wake_for_cancellation();
         }
     }
+
+    /// Return a future that is woken directly when cancellation is requested.
+    pub fn cancelled(&self) -> Cancelled<'_> {
+        Cancelled {
+            token: self,
+            waker: std::sync::Arc::new(TaskCancellationWaker {
+                task_waker: std::sync::Mutex::new(None),
+            }),
+            registered: false,
+        }
+    }
 }
 
+/// Future that resolves as soon as its [`CancellationToken`] is cancelled.
+pub struct Cancelled<'a> {
+    token: &'a CancellationToken,
+    waker: std::sync::Arc<TaskCancellationWaker>,
+    registered: bool,
+}
+
+struct TaskCancellationWaker {
+    task_waker: std::sync::Mutex<Option<std::task::Waker>>,
+}
+
+impl CancellationWaker for TaskCancellationWaker {
+    fn cancellation_waker_id(&self) -> usize {
+        self as *const Self as usize
+    }
+
+    fn wake_for_cancellation(&self) {
+        if let Some(waker) = self
+            .task_waker
+            .lock()
+            .expect("cancellation task waker poisoned")
+            .take()
+        {
+            waker.wake();
+        }
+    }
+}
+
+impl std::future::Future for Cancelled<'_> {
+    type Output = ();
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        if self.token.is_cancelled() {
+            return std::task::Poll::Ready(());
+        }
+
+        *self
+            .waker
+            .task_waker
+            .lock()
+            .expect("cancellation task waker poisoned") = Some(cx.waker().clone());
+
+        if !self.registered {
+            let waker: std::sync::Arc<dyn CancellationWaker> = self.waker.clone();
+            self.token.register_waker(&waker);
+            self.registered = true;
+        }
+
+        if self.token.is_cancelled() {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    }
+}
 /// Advisory runtime information handed to a codec after construction.
 ///
 /// The struct is deliberately tiny for now. New fields can be added
@@ -197,6 +266,43 @@ mod tests {
         assert!(token.is_cancelled());
         token.cancel();
         assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn cancelled_future_is_woken_without_polling() {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct FlagWaker(AtomicBool);
+        impl Wake for FlagWaker {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let token = CancellationToken::new();
+        let mut future = Box::pin(token.cancelled());
+        let flag = Arc::new(FlagWaker(AtomicBool::new(false)));
+        let waker = Waker::from(flag.clone());
+        let mut context = Context::from_waker(&waker);
+        assert!(matches!(
+            Pin::new(&mut future).poll(&mut context),
+            Poll::Pending
+        ));
+
+        token.cancel();
+        assert!(flag.0.load(Ordering::SeqCst));
+        assert!(matches!(
+            Pin::new(&mut future).poll(&mut context),
+            Poll::Ready(())
+        ));
     }
 
     #[test]
