@@ -69,6 +69,12 @@ pub enum Error {
     #[error("resource exhausted: {0}")]
     ResourceExhausted(String),
 
+    /// A hardware or graphics device was irrecoverably lost. Callers must
+    /// stop submitting work to the affected device and unwind/recreate it;
+    /// retrying the same operation on that device is invalid.
+    #[error("device lost: {0}")]
+    DeviceLost(String),
+
     /// Cooperative cancellation requested by the caller. Blocking decoder
     /// operations should surface this immediately so the pipeline can unwind
     /// without treating cancellation as malformed media.
@@ -95,6 +101,11 @@ impl Error {
     /// Construct an [`Error::Other`] with the given message.
     pub fn other(msg: impl Into<String>) -> Self {
         Self::Other(msg.into())
+    }
+
+    /// Construct an [`Error::DeviceLost`] with the given message.
+    pub fn device_lost(msg: impl Into<String>) -> Self {
+        Self::DeviceLost(msg.into())
     }
 
     /// Construct an [`Error::Cancelled`] with the given message.
@@ -133,6 +144,11 @@ impl Error {
     /// bytes and retry" signal.
     pub fn is_need_more(&self) -> bool {
         matches!(self, Self::NeedMore)
+    }
+
+    /// `true` for [`Error::DeviceLost`].
+    pub fn is_device_lost(&self) -> bool {
+        matches!(self, Self::DeviceLost(_))
     }
 
     /// `true` for [`Error::Cancelled`].
@@ -175,6 +191,10 @@ mod tests {
             Error::resource_exhausted("pool"),
             Error::ResourceExhausted(s) if s == "pool"
         ));
+        assert!(matches!(
+            Error::device_lost("gpu"),
+            Error::DeviceLost(s) if s == "gpu"
+        ));
         assert!(matches!(Error::cancelled("stop"), Error::Cancelled(s) if s == "stop"));
     }
 
@@ -187,6 +207,7 @@ mod tests {
         assert!(Error::Eof.is_starved());
         assert!(Error::NeedMore.is_starved());
         assert!(Error::resource_exhausted("x").is_resource_exhausted());
+        assert!(Error::device_lost("gpu").is_device_lost());
         assert!(Error::cancelled("x").is_cancelled());
         for e in [
             Error::invalid("bad"),
@@ -199,6 +220,7 @@ mod tests {
             assert!(!e.is_need_more());
             assert!(!e.is_starved());
             assert!(!e.is_resource_exhausted());
+            assert!(!e.is_device_lost());
             assert!(!e.is_cancelled());
         }
     }
@@ -221,6 +243,7 @@ mod tests {
             Error::resource_exhausted("v").to_string(),
             "resource exhausted: v"
         );
+        assert_eq!(Error::device_lost("gpu").to_string(), "device lost: gpu");
         assert_eq!(Error::other("u").to_string(), "u");
     }
 }
