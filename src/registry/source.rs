@@ -54,6 +54,13 @@ pub trait PacketSource: Send {
     /// end of stream.
     fn next_packet(&mut self) -> Result<Packet>;
 
+    /// Poll for a packet without waiting for new externally published media.
+    /// `Ok(None)` means temporarily unavailable, not end-of-stream. Sources
+    /// using the default implementation retain their original behaviour.
+    fn poll_next_packet(&mut self) -> Result<Option<Packet>> {
+        self.next_packet().map(Some)
+    }
+
     /// Seek to the nearest decode-safe point at or before `pts`, expressed
     /// in the selected stream's time base. A successful return means the
     /// source has changed its internal read position and the next
